@@ -37,10 +37,10 @@
 | `scripts/start-backend.ps1` | 启动 Web 服务 |
 | `scripts/check.ps1` | 运行格式化、Clippy 和测试检查 |
 | `docs/ARCHITECTURE.md` | 架构和 Rust 技术点说明 |
-| `docs/TEAMWORK.md` | 小组分工说明 |
+| `docs/TEAMWORK.md` | 模块职责说明 |
 
-## 本地文件约定
+## 配置说明
 
-- `.env`：本地环境变量，包含数据库密码和 API Key，不提交。
-- `.env.example`：环境变量模板，只保留字段名和示例值。
-- `target/`：Rust 编译产物，不提交。
+- `.env.example`：环境变量模板，包含数据库连接、服务端口、模型接口等配置项。
+- 数据库连接用于读取用户、MBTI、院校推荐和一分一段表数据。
+- 模型 API Key 为可选配置，未配置时系统会使用本地算法生成说明。

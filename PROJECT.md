@@ -1,16 +1,16 @@
-# 项目提交说明
+# 项目概览
 
-这个目录是小橘助手 Rust 项目的提交目录，包含运行和演示所需的源码、资源、数据脚本和文档。
+小橘助手是一个面向高考志愿填报场景的 Rust Web 应用，提供学生信息采集、院校推荐、志愿组合分析、MBTI 职业探索、专业知识图谱和智能问答服务。
 
-## 内容
+## 目录内容
 
-- `src/`：Rust 源码。
-- `frontend/src/`：页面图片资源。
+- `src/`：Rust 源码，包含服务入口、路由、认证、推荐算法、MBTI、知识图谱、模型问答等模块。
+- `frontend/src/`：页面使用的图片资源。
 - `frontend/lib/`：知识图谱页面需要的前端库。
 - `database/`：MySQL 初始化脚本。
-- `data/`：知识图谱数据文件。
-- `scripts/`：启动和检查脚本。
-- `docs/`：架构、分工和目录说明文档。
+- `data/`：专业知识图谱数据文件。
+- `scripts/`：服务启动和项目检查脚本。
+- `docs/`：架构、模块职责和目录说明文档。
 - `Cargo.toml`、`Cargo.lock`：Rust 项目配置。
 - `.env.example`：环境变量模板。
 
@@ -25,4 +25,3 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-backend.ps1
 ```text
 http://127.0.0.1:8000
 ```
-
