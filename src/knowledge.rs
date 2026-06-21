@@ -117,6 +117,7 @@ impl KnowledgeGraph {
     }
 
     pub fn match_categories(&self, query: &str, limit: usize) -> Vec<String> {
+        let parent_matches = self.parent_categories_for_query(query);
         let mut scored: Vec<(String, f64)> = self
             .categories
             .iter()
@@ -125,16 +126,21 @@ impl KnowledgeGraph {
                 let direct = query.contains(category) || (!stem.is_empty() && query.contains(stem));
                 let overlap = character_similarity(query, category);
                 let synonyms = synonym_score(query, category);
-                let score = if direct {
+                let score = if parent_matches.contains(category) {
+                    4.0
+                } else if direct {
                     3.0
                 } else if synonyms > 0.0 {
                     2.0 + synonyms
                 } else {
                     overlap
                 };
-                (score >= 0.45).then(|| (category.clone(), score))
+                (score >= 0.72).then(|| (category.clone(), score))
             })
             .collect();
+        if scored.iter().any(|(_, score)| *score >= 2.0) {
+            scored.retain(|(_, score)| *score >= 2.0);
+        }
         scored.sort_by(|left, right| {
             right
                 .1
@@ -146,6 +152,20 @@ impl KnowledgeGraph {
             .take(limit)
             .map(|(category, _)| category)
             .collect()
+    }
+
+    fn parent_categories_for_query(&self, query: &str) -> HashSet<String> {
+        let mut parents = HashSet::new();
+        for record in &self.records {
+            if record.kind == "实体关系"
+                && record.predicate.contains("包含")
+                && self.categories.contains(&record.subject)
+                && query.contains(record.object.as_str())
+            {
+                parents.insert(record.subject.clone());
+            }
+        }
+        parents
     }
 
     pub fn focused_related_records(
@@ -185,30 +205,6 @@ impl KnowledgeGraph {
             }
         }
         result
-    }
-
-    pub fn fallback_explanation(&self, query: &str, categories: &[String]) -> String {
-        if categories.is_empty() {
-            return format!(
-                "根据“{}”暂时没有匹配到明确的专业类别。建议补充具体学科、兴趣活动或未来职业方向，例如“喜欢物理和编程，希望从事智能制造”。",
-                query.trim()
-            );
-        }
-        let mut sections = Vec::new();
-        for category in categories.iter().take(6) {
-            let majors = self.direct_children(category, 8);
-            let description = if majors.is_empty() {
-                "可继续查看该类别的课程结构、培养方向和就业领域".to_owned()
-            } else {
-                format!("常见专业包括{}", majors.join("、"))
-            };
-            sections.push(format!("- {category}：{description}"));
-        }
-        format!(
-            "根据您的输入“{}”，系统识别出较相关的专业方向：\n{}\n\n建议结合课程兴趣、选科限制、院校学科实力和未来职业目标继续比较。",
-            query.trim(),
-            sections.join("\n")
-        )
     }
 
     fn direct_children(&self, category: &str, limit: usize) -> Vec<String> {
@@ -307,6 +303,10 @@ fn character_similarity(left: &str, right: &str) -> f64 {
 fn synonym_score(query: &str, category: &str) -> f64 {
     let groups: &[(&[&str], &[&str])] = &[
         (
+            &["物理", "物理学", "应用物理", "核物理", "量子", "声学"],
+            &["物理学类"],
+        ),
+        (
             &["计算机", "软件", "编程", "人工智能", "算法", "数据"],
             &["计算机类", "电子信息类", "自动化类"],
         ),
@@ -368,5 +368,22 @@ mod tests {
         let analysis = graph.analyze("我喜欢编程");
         assert!(analysis.matched_categories.contains(&"计算机类".to_owned()));
         assert!(!analysis.related_entities.is_empty());
+    }
+
+    #[test]
+    fn physics_query_does_not_match_broad_related_categories() {
+        let graph = KnowledgeGraph::from_records(parse_records(
+            "(实体; 物理学类; 专业类; 包含物理学、应用物理学等专业)\n\
+             (实体; 心理学类; 专业类; 包含心理学等专业)\n\
+             (实体; 护理学类; 专业类; 包含护理学、助产学等专业)\n\
+             (实体; 物理学; 专业名称; 专业代码:070201)\n\
+             (实体; 心理学; 专业名称; 专业代码:071101)\n\
+             (实体; 护理学; 专业名称; 专业代码:101101)\n\
+             (实体关系; 物理学类; 包含; 物理学)\n\
+             (实体关系; 心理学类; 包含; 心理学)\n\
+             (实体关系; 护理学类; 包含; 护理学)",
+        ));
+        let analysis = graph.analyze("我对物理学感兴趣");
+        assert_eq!(analysis.matched_categories, vec!["物理学类".to_owned()]);
     }
 }

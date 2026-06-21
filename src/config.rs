@@ -2,7 +2,7 @@ use std::{env, net::IpAddr, str::FromStr};
 
 use sqlx::{
     MySql, Pool,
-    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode},
 };
 
 use crate::error::{AppError, AppResult};
@@ -107,12 +107,11 @@ async fn connect_optional(
     let options = match MySqlConnectOptions::from_str(url) {
         Ok(options) => options,
         Err(error) => {
-            warnings.push(format!(
-                "{label}连接字符串无效，将使用内置演示数据：{error}"
-            ));
+            warnings.push(format!("{label}连接字符串无效，相关功能将不可用：{error}"));
             return None;
         }
-    };
+    }
+    .ssl_mode(MySqlSslMode::Disabled);
     match MySqlPoolOptions::new()
         .min_connections(0)
         .max_connections(8)
@@ -122,7 +121,7 @@ async fn connect_optional(
     {
         Ok(pool) => Some(pool),
         Err(error) => {
-            warnings.push(format!("{label}暂不可用，将使用内置演示数据：{error}"));
+            warnings.push(format!("{label}暂不可用，相关功能将不可用：{error}"));
             None
         }
     }

@@ -624,7 +624,7 @@ mod tests {
         }
     }
 
-    fn sample_table() -> RecommendationTable {
+    fn test_table() -> RecommendationTable {
         RecommendationTable {
             reach: vec![school("A大学", 575.0, "42.0%")],
             match_list: vec![
@@ -635,7 +635,7 @@ mod tests {
         }
     }
 
-    fn sample_profile() -> StudentProfile {
+    fn test_profile() -> StudentProfile {
         StudentProfile {
             score: "560".into(),
             live_city: "天津市".into(),
@@ -658,8 +658,8 @@ mod tests {
 
     #[test]
     fn analysis_has_expected_counts() {
-        let table = sample_table();
-        let profile = sample_profile();
+        let table = test_table();
+        let profile = test_profile();
         let analysis = analyze(&table, Some(&profile));
         assert_eq!(analysis.summary.total_choices, 4);
         assert_eq!(analysis.summary.unique_schools, 4);
@@ -669,8 +669,8 @@ mod tests {
 
     #[test]
     fn simulation_is_reproducible() {
-        let table = sample_table();
-        let profile = sample_profile();
+        let table = test_table();
+        let profile = test_profile();
         let diagnostics = collect_diagnostics(&table, Some(&profile));
         let left = simulate(&diagnostics, 1000, 42);
         let right = simulate(&diagnostics, 1000, 42);

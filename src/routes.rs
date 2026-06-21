@@ -21,7 +21,7 @@ use crate::{
     auth,
     error::{AppError, AppResult},
     frontend,
-    llm::{chunk_text, fallback_chat, fallback_recommendation_summary},
+    llm::chunk_text,
     mbti,
     models::{
         AppState, ChatRequest, MbtiChoiceRequest, MbtiTypeRequest, StudentProfile,
@@ -117,7 +117,6 @@ async fn update_student(
     State(state): State<Arc<AppState>>,
     Json(profile): Json<StudentProfile>,
 ) -> AppResult<Json<StudentUpdateResponse>> {
-    let _ = recommendation::generate(&state, &profile).await?;
     *state.student.write().await = Some(profile.clone());
     Ok(Json(StudentUpdateResponse {
         status: "success",
@@ -164,20 +163,15 @@ async fn recommend_summary(State(state): State<Arc<AppState>>) -> AppResult<Json
         return Err(AppError::NotFound("推荐结果尚未生成".into()));
     }
     let student = state.student.read().await.clone();
-    let summary = if state.llm.is_configured() {
-        match state
-            .llm
-            .recommendation_summary(student.as_ref(), &table)
-            .await
-        {
-            Ok(answer) => answer,
-            Err(error) => format!(
-                "## 模型调用失败\n\n{error}\n\n已检测到你配置了 DEEPSEEK_API_KEY，因此系统不会改用本地说明。请检查 API Key、模型名、代理网络或 DEEPSEEK_BASE_URL。"
-            ),
-        }
-    } else {
-        fallback_recommendation_summary(student.as_ref(), &table)
-    };
+    if !state.llm.is_configured() {
+        return Err(AppError::Llm(
+            "未配置 DEEPSEEK_API_KEY，无法生成推荐解读".into(),
+        ));
+    }
+    let summary = state
+        .llm
+        .recommendation_summary(student.as_ref(), &table)
+        .await?;
     Ok(Json(json!({ "summary": summary })))
 }
 
@@ -217,20 +211,13 @@ async fn process_major(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let analysis = state.graph.analyze(&request.text);
     let answer = if state.llm.is_configured() {
-        match state
+        state
             .llm
             .explain_major(&request.text, &analysis.matched_categories)
             .await
-        {
-            Ok(answer) => answer,
-            Err(error) => format!(
-                "模型调用失败：{error}\n\n已检测到你配置了 DEEPSEEK_API_KEY，因此系统不会改用本地说明。请检查 API Key、模型名、代理网络或 DEEPSEEK_BASE_URL。"
-            ),
-        }
+            .unwrap_or_else(|error| format!("模型调用失败：{error}"))
     } else {
-        state
-            .graph
-            .fallback_explanation(&request.text, &analysis.matched_categories)
+        "未配置 DEEPSEEK_API_KEY，无法生成专业探索说明。".into()
     };
     sse_text(answer)
 }
@@ -253,18 +240,13 @@ async fn chat_stream(
     let student = state.student.read().await.clone();
     let recommendations = state.recommendation.read().await.clone();
     let answer = if state.llm.is_configured() {
-        match state
+        state
             .llm
             .chat(&request, student.as_ref(), &recommendations)
             .await
-        {
-            Ok(answer) => answer,
-            Err(error) => format!(
-                "模型调用失败：{error}\n\n已检测到你配置了 DEEPSEEK_API_KEY，因此系统不会改用本地说明。请检查 API Key、模型名、代理网络或 DEEPSEEK_BASE_URL。"
-            ),
-        }
+            .unwrap_or_else(|error| format!("模型调用失败：{error}"))
     } else {
-        fallback_chat(&request, student.as_ref(), &recommendations)
+        "未配置 DEEPSEEK_API_KEY，无法生成模型回答。".into()
     };
     sse_text(answer)
 }

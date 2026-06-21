@@ -4,6 +4,7 @@ use std::{
 };
 
 use sqlx::{Column, Row};
+use tracing::info;
 
 use crate::{
     error::{AppError, AppResult},
@@ -101,26 +102,105 @@ pub async fn generate(
     profile: &StudentProfile,
 ) -> AppResult<RecommendationTable> {
     validate_profile(profile)?;
-    let candidates = if let Some(pool) = &state.databases.college {
-        match fetch_candidates(pool, profile).await {
-            Ok(rows) if !rows.is_empty() => rows,
-            Ok(_) | Err(_) => fallback_candidates(profile),
+    let pool = state
+        .databases
+        .college
+        .as_ref()
+        .ok_or_else(|| AppError::Config("院校数据库不可用，无法生成推荐结果".into()))?;
+    if !state.llm.is_configured() {
+        return Err(AppError::Llm(
+            "未配置 DEEPSEEK_API_KEY，无法由大模型生成查询 SQL".into(),
+        ));
+    }
+    let sql = state.llm.recommendation_sql(profile).await?;
+    info!(sql = %sql, "LLM generated recommendation SQL");
+    validate_recommendation_sql(&sql)?;
+    let candidates = match fetch_candidates(pool, profile, &sql).await {
+        Ok(candidates) if !candidates.is_empty() => candidates,
+        Ok(_) => {
+            let hint = empty_recommendation_hint(profile);
+            let fixed_sql = state.llm.repair_sql(&sql, &hint).await?;
+            info!(sql = %fixed_sql, "LLM repaired empty recommendation SQL");
+            validate_recommendation_sql(&fixed_sql)?;
+            let fixed_candidates = fetch_candidates(pool, profile, &fixed_sql).await?;
+            if fixed_candidates.is_empty() {
+                let second_hint = strict_empty_recommendation_hint(profile);
+                let second_sql = state.llm.repair_sql(&fixed_sql, &second_hint).await?;
+                info!(sql = %second_sql, "LLM repaired empty recommendation SQL again");
+                validate_recommendation_sql(&second_sql)?;
+                fetch_candidates(pool, profile, &second_sql).await?
+            } else {
+                fixed_candidates
+            }
         }
-    } else {
-        fallback_candidates(profile)
+        Err(AppError::Database(error)) => {
+            let fixed_sql = state.llm.repair_sql(&sql, &error).await?;
+            info!(sql = %fixed_sql, "LLM repaired failed recommendation SQL");
+            validate_recommendation_sql(&fixed_sql)?;
+            fetch_candidates(pool, profile, &fixed_sql).await?
+        }
+        Err(error) => return Err(error),
     };
+    if candidates.is_empty() {
+        return Err(AppError::NotFound(
+            "大模型生成的 SQL 未查询到匹配院校数据".into(),
+        ));
+    }
     Ok(rank_candidates(profile, candidates))
+}
+
+fn empty_recommendation_hint(profile: &StudentProfile) -> String {
+    format!(
+        "SQL 执行成功但返回 0 行。必须重新生成更宽松的院校推荐 SQL，并遵守：\
+         1. 不要把 live_city/所在地作为 WHERE 硬过滤；用户所在地是偏好，只能用于 ORDER BY 加权。\
+         2. 数据表 tianjin_enrollment_plan.`所在地` 存的是省市简称，例如天津、北京、河北，不是天津市；如果要排序偏好，应使用 TRIM(e.`所在地`) LIKE '天津%'。\
+         3. 不要要求 TRIM(e.`所在地`) = '{}'。\
+         4. 专业偏好可以作为排序优先项，不要因为专业 LIKE 过严导致 0 行；至少保留计算机、软件、数据、电子信息、自动化等宽泛方向。\
+         5. 分数范围至少覆盖学生分数下 120 分到上 60 分，必要时不要在 WHERE 中限制分数，只在 ORDER BY 中按 ABS(average_score - 用户分数) 排序。\
+         6. 计划数必须用 SUM(CAST(REPLACE(e.`计划数`, ',', '') AS UNSIGNED)) 聚合。\
+         用户画像：{}",
+        profile.live_city.trim(),
+        serde_json::to_string(profile).unwrap_or_default()
+    )
+}
+
+fn strict_empty_recommendation_hint(profile: &StudentProfile) -> String {
+    format!(
+        "上一次修复后的 SQL 仍然返回 0 行。请大幅放宽：\
+         必须移除所有 e.`所在地` / city_name 的 WHERE 条件；\
+         必须移除 WHERE 中的专业名称 LIKE 组合，改为 ORDER BY 中优先排序；\
+         不要在 WHERE 中限制 average_score，只按 ABS(average_score - {}) 排序；\
+         只保留必要的 JOIN、选科可选条件和 LIMIT。\
+         输出仍需包含 school_name, major_name, city_name, subject_requirement, enrollment, average_score, assessment, school_ranking。\
+         用户画像：{}",
+        profile.score_value().unwrap_or(560.0),
+        serde_json::to_string(profile).unwrap_or_default()
+    )
 }
 
 pub async fn score_distribution(
     state: &Arc<AppState>,
 ) -> AppResult<Vec<HashMap<String, serde_json::Value>>> {
-    let Some(pool) = &state.databases.scores else {
-        return Ok(fallback_score_distribution());
+    let pool = state
+        .databases
+        .scores
+        .as_ref()
+        .ok_or_else(|| AppError::Config("一分一段数据库不可用".into()))?;
+    if !state.llm.is_configured() {
+        return Err(AppError::Llm(
+            "未配置 DEEPSEEK_API_KEY，无法由大模型生成一分一段查询 SQL".into(),
+        ));
+    }
+    let sql = state.llm.score_distribution_sql().await?;
+    validate_readonly_sql(&sql, &["Tianjin_score_distribution"])?;
+    let rows = match sqlx::query(&sql).fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let fixed_sql = state.llm.repair_sql(&sql, &error.to_string()).await?;
+            validate_readonly_sql(&fixed_sql, &["Tianjin_score_distribution"])?;
+            sqlx::query(&fixed_sql).fetch_all(pool).await?
+        }
     };
-    let rows = sqlx::query("SELECT * FROM Tianjin_score_distribution ORDER BY 1 DESC")
-        .fetch_all(pool)
-        .await?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let mut item = HashMap::new();
@@ -160,65 +240,37 @@ fn validate_profile(profile: &StudentProfile) -> AppResult<()> {
 async fn fetch_candidates(
     pool: &sqlx::MySqlPool,
     profile: &StudentProfile,
+    sql: &str,
 ) -> AppResult<Vec<Candidate>> {
-    let major = normalized_optional(&profile.want_major);
-    let unwanted = normalized_optional(&profile.unwant_major);
-    let score = profile.score_value().unwrap_or_default();
-
-    // 所有用户输入都通过绑定参数传入，避免 SQL 注入风险。
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            e.院校名称 AS school_name,
-            e.专业名称 AS major_name,
-            e.所在地 AS city_name,
-            e.科目要求 AS subject_requirement,
-            SUM(CAST(REPLACE(e.计划数, ',', '') AS UNSIGNED)) AS enrollment,
-            CAST(AVG(a.总成绩) AS DOUBLE) AS average_score,
-            MAX(s.评选结果) AS assessment,
-            MIN(CAST(r.排名 AS UNSIGNED)) AS school_ranking
-        FROM tianjin_enrollment_plan e
-        JOIN tianjin_college_admission a ON e.院校名称 = a.院校名称
-        LEFT JOIN subject_assessment s
-            ON e.院校名称 = s.校名
-            AND (? = '' OR s.学科 LIKE CONCAT('%', ?, '%'))
-        LEFT JOIN common_ranking r ON e.院校名称 = r.院校
-        WHERE CAST(REPLACE(e.计划数, ',', '') AS UNSIGNED) > 0
-          AND (? = '' OR e.专业名称 LIKE CONCAT('%', ?, '%'))
-          AND (? = '' OR e.专业名称 NOT LIKE CONCAT('%', ?, '%'))
-        GROUP BY e.院校名称, e.专业名称, e.所在地, e.科目要求
-        HAVING average_score <= ? + 30
-        ORDER BY ABS(average_score - ?) ASC
-        LIMIT 500
-        "#,
-    )
-    .bind(&major)
-    .bind(&major)
-    .bind(&major)
-    .bind(&major)
-    .bind(&unwanted)
-    .bind(&unwanted)
-    .bind(score)
-    .bind(score)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    let raw_count = rows.len();
 
     let candidates = rows
         .into_iter()
         .filter_map(|row| {
             Some(Candidate {
-                school: row.try_get("school_name").ok()?,
-                major: row.try_get("major_name").ok()?,
-                city: row.try_get("city_name").unwrap_or_default(),
-                enrollment: numeric_u32(&row, "enrollment"),
-                average_score: numeric_f64(&row, "average_score"),
-                assessment: row.try_get("assessment").ok(),
-                ranking: optional_u32(&row, "school_ranking"),
-                subject_requirement: row.try_get("subject_requirement").unwrap_or_default(),
+                school: string_value(&row, &["school_name", "院校名称"], Some(0))?,
+                major: string_value(&row, &["major_name", "专业名称"], Some(1))?,
+                city: string_value(&row, &["city_name", "所在地"], Some(2)).unwrap_or_default(),
+                enrollment: numeric_u32_any(
+                    &row,
+                    &["enrollment", "招生人数", "总招生人数"],
+                    Some(3),
+                ),
+                average_score: numeric_f64_any(&row, &["average_score", "平均分"], Some(4)),
+                assessment: string_value(&row, &["assessment", "学科评估"], Some(5)),
+                ranking: optional_u32_any(&row, &["school_ranking", "学校排名"], Some(6)),
+                subject_requirement: string_value(&row, &["subject_requirement", "科目要求"], None)
+                    .unwrap_or_default(),
             })
         })
         .filter(|candidate| subject_matches(&candidate.subject_requirement, profile))
-        .collect();
+        .collect::<Vec<_>>();
+    info!(
+        raw_count,
+        parsed_count = candidates.len(),
+        "recommendation SQL rows parsed"
+    );
     Ok(candidates)
 }
 
@@ -233,7 +285,6 @@ fn rank_candidates(profile: &StudentProfile, candidates: Vec<Candidate>) -> Reco
     let mut scored: Vec<ScoredCandidate> = candidates
         .into_iter()
         .filter(|candidate| unwanted_major.is_empty() || !candidate.major.contains(&unwanted_major))
-        .filter(|candidate| candidate.average_score <= user_score + 30.0)
         .map(|candidate| {
             let score_match =
                 (1.0 - (candidate.average_score - user_score).abs() / 80.0).clamp(0.0, 1.0);
@@ -386,13 +437,19 @@ fn normalized_optional(value: &str) -> String {
 }
 
 fn subject_matches(requirement: &str, profile: &StudentProfile) -> bool {
-    if requirement.trim().is_empty() || requirement.contains("不限") {
+    let requirement = requirement.trim();
+    if requirement.is_empty() || requirement.contains("不限") {
         return true;
     }
     let selected = profile.subject_list();
-    selected
-        .iter()
-        .all(|subject| requirement.contains(subject) || !requirement.contains('加'))
+    if selected.is_empty() {
+        return true;
+    }
+    requirement
+        .split(['加', '或', ',', '，', '/', '、', ' '])
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .all(|required| selected.iter().any(|subject| required.contains(subject)))
 }
 
 fn keyword_overlap(candidate: &str, wanted: &str) -> f64 {
@@ -426,8 +483,35 @@ fn numeric_u32(row: &sqlx::mysql::MySqlRow, name: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn optional_u32(row: &sqlx::mysql::MySqlRow, name: &str) -> Option<u32> {
-    let value = numeric_u32(row, name);
+fn numeric_u32_at(row: &sqlx::mysql::MySqlRow, index: usize) -> u32 {
+    row.try_get::<u64, _>(index)
+        .map(|value| value.min(u32::MAX as u64) as u32)
+        .or_else(|_| {
+            row.try_get::<i64, _>(index)
+                .map(|value| value.max(0).min(u32::MAX as i64) as u32)
+        })
+        .or_else(|_| {
+            row.try_get::<String, _>(index)
+                .map(|value| value.replace(',', "").parse().unwrap_or(0))
+        })
+        .unwrap_or(0)
+}
+
+fn numeric_u32_any(row: &sqlx::mysql::MySqlRow, names: &[&str], index: Option<usize>) -> u32 {
+    names
+        .iter()
+        .map(|name| numeric_u32(row, name))
+        .chain(index.map(|index| numeric_u32_at(row, index)))
+        .find(|value| *value > 0)
+        .unwrap_or(0)
+}
+
+fn optional_u32_any(
+    row: &sqlx::mysql::MySqlRow,
+    names: &[&str],
+    index: Option<usize>,
+) -> Option<u32> {
+    let value = numeric_u32_any(row, names, index);
     (value > 0).then_some(value)
 }
 
@@ -441,83 +525,89 @@ fn numeric_f64(row: &sqlx::mysql::MySqlRow, name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn fallback_candidates(profile: &StudentProfile) -> Vec<Candidate> {
-    let score = profile.score_value().unwrap_or(550.0);
-    let wanted = normalized_optional(&profile.want_major);
-    let major = if wanted.is_empty() {
-        "计算机科学与技术".to_owned()
-    } else {
-        wanted
-    };
-    let seeds = [
-        ("南开大学", "天津", 640.0, 20, "A", 20),
-        ("天津大学", "天津", 635.0, 28, "A", 21),
-        ("北京科技大学", "北京", 612.0, 24, "A-", 35),
-        ("河北工业大学", "天津", 590.0, 42, "B+", 103),
-        ("天津医科大学", "天津", 585.0, 30, "B+", 120),
-        ("天津师范大学", "天津", 565.0, 55, "B", 150),
-        ("天津工业大学", "天津", 560.0, 65, "B+", 145),
-        ("天津财经大学", "天津", 552.0, 48, "B", 180),
-        ("天津理工大学", "天津", 545.0, 72, "B-", 190),
-        ("中国民航大学", "天津", 540.0, 80, "B", 170),
-        ("天津科技大学", "天津", 532.0, 88, "B-", 210),
-        ("天津商业大学", "天津", 520.0, 96, "C+", 240),
-        ("天津城建大学", "天津", 510.0, 105, "C+", 260),
-        ("河北科技大学", "石家庄", 505.0, 110, "C+", 250),
-        ("山东科技大学", "青岛", 548.0, 75, "B", 125),
-        ("燕山大学", "秦皇岛", 570.0, 60, "B+", 95),
-        ("北京信息科技大学", "北京", 575.0, 45, "B", 140),
-        ("大连交通大学", "大连", 530.0, 84, "B-", 230),
-    ];
-    seeds
-        .into_iter()
-        .filter(|(_, _, avg, _, _, _)| *avg <= score + 30.0)
-        .map(
-            |(school, city, average_score, enrollment, assessment, ranking)| Candidate {
-                school: school.into(),
-                major: major.clone(),
-                city: city.into(),
-                enrollment,
-                average_score,
-                assessment: Some(assessment.into()),
-                ranking: Some(ranking),
-                subject_requirement: "不限".into(),
-            },
-        )
-        .collect()
+fn numeric_f64_at(row: &sqlx::mysql::MySqlRow, index: usize) -> f64 {
+    row.try_get::<f64, _>(index)
+        .or_else(|_| row.try_get::<f32, _>(index).map(f64::from))
+        .or_else(|_| {
+            row.try_get::<String, _>(index)
+                .map(|value| value.parse().unwrap_or(0.0))
+        })
+        .unwrap_or(0.0)
 }
 
-fn fallback_score_distribution() -> Vec<HashMap<String, serde_json::Value>> {
-    [
-        (680, 72, 612),
-        (670, 118, 1095),
-        (660, 165, 1802),
-        (650, 234, 2821),
-        (640, 312, 4168),
-        (630, 406, 5890),
-        (620, 515, 8014),
-        (610, 638, 10683),
-        (600, 760, 13921),
-        (590, 891, 17780),
-        (580, 1012, 22245),
-        (570, 1110, 27190),
-        (560, 1204, 32510),
-        (550, 1295, 38120),
-        (540, 1360, 43950),
-        (530, 1412, 49880),
-        (520, 1450, 55870),
-        (510, 1480, 61820),
-        (500, 1510, 67640),
-    ]
-    .into_iter()
-    .map(|(score, count, cumulative)| {
-        HashMap::from([
-            ("分数".into(), serde_json::json!(score)),
-            ("本段人数".into(), serde_json::json!(count)),
-            ("累计人数".into(), serde_json::json!(cumulative)),
-        ])
-    })
-    .collect()
+fn numeric_f64_any(row: &sqlx::mysql::MySqlRow, names: &[&str], index: Option<usize>) -> f64 {
+    names
+        .iter()
+        .map(|name| numeric_f64(row, name))
+        .chain(index.map(|index| numeric_f64_at(row, index)))
+        .find(|value| *value > 0.0)
+        .unwrap_or(0.0)
+}
+
+fn string_value(
+    row: &sqlx::mysql::MySqlRow,
+    names: &[&str],
+    index: Option<usize>,
+) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| row.try_get(*name).ok())
+        .or_else(|| index.and_then(|index| row.try_get(index).ok()))
+}
+
+pub fn validate_readonly_sql(sql: &str, allowed_tables: &[&str]) -> AppResult<()> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("select ") && !lower.starts_with("with ") {
+        return Err(AppError::Validation(
+            "大模型只能生成 SELECT/WITH 查询".into(),
+        ));
+    }
+    let forbidden = [
+        ";",
+        "--",
+        "/*",
+        "*/",
+        " insert ",
+        " update ",
+        " delete ",
+        " drop ",
+        " alter ",
+        " create ",
+        " truncate ",
+        " replace ",
+        " union ",
+        " grant ",
+        " revoke ",
+        " load_file",
+        " into outfile",
+    ];
+    if forbidden.iter().any(|token| lower.contains(token)) {
+        return Err(AppError::Validation(
+            "大模型生成的 SQL 包含不允许的操作".into(),
+        ));
+    }
+    let mentions_allowed_table = allowed_tables
+        .iter()
+        .any(|table| lower.contains(&table.to_ascii_lowercase()));
+    if !mentions_allowed_table {
+        return Err(AppError::Validation(
+            "大模型生成的 SQL 未访问允许的数据表".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recommendation_sql(sql: &str) -> AppResult<()> {
+    validate_readonly_sql(
+        sql,
+        &[
+            "tianjin_enrollment_plan",
+            "tianjin_college_admission",
+            "subject_assessment",
+            "common_ranking",
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -546,10 +636,62 @@ mod tests {
     #[test]
     fn produces_three_tiers() {
         let profile = profile("560", "院校优先");
-        let table = rank_candidates(&profile, fallback_candidates(&profile));
+        let candidates = vec![
+            Candidate {
+                school: "A大学".into(),
+                major: "计算机科学与技术".into(),
+                city: "天津".into(),
+                enrollment: 20,
+                average_score: 570.0,
+                assessment: Some("B+".into()),
+                ranking: Some(100),
+                subject_requirement: "不限".into(),
+            },
+            Candidate {
+                school: "B大学".into(),
+                major: "软件工程".into(),
+                city: "天津".into(),
+                enrollment: 30,
+                average_score: 555.0,
+                assessment: Some("B".into()),
+                ranking: Some(150),
+                subject_requirement: "不限".into(),
+            },
+            Candidate {
+                school: "C大学".into(),
+                major: "数据科学".into(),
+                city: "天津".into(),
+                enrollment: 40,
+                average_score: 530.0,
+                assessment: Some("C+".into()),
+                ranking: Some(200),
+                subject_requirement: "不限".into(),
+            },
+        ];
+        let table = rank_candidates(&profile, candidates);
         assert!(!table.is_empty());
         assert!(table.reach.iter().all(|item| item.average_score > 560.0));
         assert!(table.safe.iter().all(|item| item.average_score < 548.0));
+    }
+
+    #[test]
+    fn rejects_dangerous_ai_sql() {
+        assert!(validate_readonly_sql("DELETE FROM users", &["users"]).is_err());
+        assert!(
+            validate_readonly_sql(
+                "SELECT * FROM tianjin_enrollment_plan LIMIT 1",
+                &["tianjin_enrollment_plan"]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn subject_requirement_is_subset_of_selected_subjects() {
+        let profile = profile("560", "院校优先");
+        assert!(subject_matches("物理加化学", &profile));
+        assert!(subject_matches("不限", &profile));
+        assert!(!subject_matches("历史加地理", &profile));
     }
 
     #[test]
