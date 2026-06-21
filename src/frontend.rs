@@ -265,6 +265,7 @@ const state = {
   answers: {},
   mbtiPage: 0,
   chatHistory: [],
+  recommendationSubmitting: false,
 };
 
 const pages = [
@@ -412,17 +413,17 @@ function homePage() {
         <div class="glass-card">
           <div class="prompt-row"><img src="/assets/clx.png" width="80" /><span>填好后请点击最下方橘子提交</span></div>
           <div class="grid grid-2">
-            ${field("province","所在省份", "select", provinces(), "天津市")}
-            ${field("score","高考总分", "number", "", "560")}
-            ${field("rank","全省排名", "number", "", "12000")}
+            ${field("province","所在省份", "select", provinces())}
+            ${field("score","高考总分", "number")}
+            ${field("rank","全省排名", "number")}
             ${subjectsField()}
           </div>
-          ${field("want","感兴趣专业🍊", "text", "", "计算机")}
-          ${field("unwant","不感兴趣专业🍊", "text", "", "无")}
-          ${field("goal","职业发展目标🍊", "text", "", "软件工程师")}
-          ${field("strategy","志愿填报策略🍊", "select", ["科目优先","城市优先","院校优先"], "科目优先")}
-          ${field("city","偏好城市？", "text", "", "")}
-          ${field("hobby","兴趣爱好🍊", "text", "", "编程")}
+          ${field("want","感兴趣专业🍊", "text")}
+          ${field("unwant","不感兴趣专业🍊", "text")}
+          ${field("goal","职业发展目标🍊", "text")}
+          ${field("strategy","志愿填报策略🍊", "select", ["科目优先","城市优先","院校优先"])}
+          ${field("city","偏好城市？", "text")}
+          ${field("hobby","兴趣爱好🍊", "text")}
           <p class="center"><button class="orange-btn" title="提交" onclick="submitStudent()"></button></p>
         </div>
         <details class="glass-card"><summary>还不清楚自己的排名？点击查看一分一段表🍊</summary><div id="score-table">加载中...</div></details>
@@ -433,14 +434,24 @@ function homePage() {
   startHero();
 }
 function field(id,label,type,options,value="") {
-  if (type === "select") return `<div class="field"><label>${label}</label><select id="${id}">${options.map(o=>`<option ${o===value?"selected":""}>${o}</option>`).join("")}</select></div>`;
+  if (type === "select") {
+    const placeholder = value ? "" : `<option value="" disabled selected>请选择</option>`;
+    return `<div class="field"><label>${label}</label><select id="${id}">${placeholder}${options.map(o=>`<option ${o===value?"selected":""}>${o}</option>`).join("")}</select></div>`;
+  }
   return `<div class="field"><label>${label}</label><input id="${id}" type="${type}" value="${escapeHtml(value)}" /></div>`;
 }
 function subjectsField() {
   const subjects = ["物理", "化学", "生物", "政治", "历史", "地理", "技术"];
-  return `<div class="field"><label>选考科目（最多选择 3 门）</label><div class="check-grid">${subjects.map((s, i) =>
-    `<label><input type="checkbox" name="subject" value="${s}" ${i < 3 ? "checked" : ""}>${s}</label>`
+  return `<div class="field"><label>选考科目（必须选择 3 门）</label><div class="check-grid">${subjects.map(s =>
+    `<label><input type="checkbox" name="subject" value="${s}" onchange="limitSubjects(this)">${s}</label>`
   ).join("")}</div></div>`;
+}
+function limitSubjects(changed) {
+  const selected = document.querySelectorAll("input[name=subject]:checked");
+  if (selected.length > 3) {
+    changed.checked = false;
+    showToast("选考科目只能选择 3 门");
+  }
 }
 function provinces(){return ["北京市","天津市","河北省","山西省","内蒙古自治区","辽宁省","吉林省","黑龙江省","上海市","江苏省","浙江省","安徽省","福建省","江西省","山东省","河南省","湖北省","湖南省","广东省","广西壮族自治区","海南省","重庆市","四川省","贵州省","云南省","西藏自治区","陕西省","甘肃省","青海省","宁夏回族自治区","新疆维吾尔自治区"];}
 async function loadScoreDistribution() {
@@ -454,8 +465,12 @@ function startHero() {
 }
 async function submitStudent() {
   const selectedSubjects = [...document.querySelectorAll("input[name=subject]:checked")].map(el => el.value);
-  if (selectedSubjects.length === 0 || selectedSubjects.length > 3) {
-    showToast("请选择 1 到 3 门选考科目");
+  if (!$("province").value || !$("score").value || !$("rank").value || !$("strategy").value) {
+    showToast("请填写省份、分数、排名和志愿填报策略");
+    return;
+  }
+  if (selectedSubjects.length !== 3) {
+    showToast("选考科目必须且只能选择 3 门");
     return;
   }
   const profile = {
@@ -468,16 +483,33 @@ async function submitStudent() {
   $("app").innerHTML = `<div class="page"><h2>确认信息</h2><div class="glass-card">${objectTable([{
     所在省份:profile.live_city, 高考总分:profile.score, 选考科目:profile.subjects, 全省排名:profile.rank,
     感兴趣专业:profile.want_major, 不感兴趣专业:profile.unwant_major, 职业发展目标:profile.future_goal, 志愿填报策略:profile.strategy, 兴趣爱好:profile.hobby
-  }])}<p><button class="btn" onclick="confirmStudent()">确认信息无误，提交</button> <button class="btn secondary" onclick="homePage()">返回上一页</button></p></div></div>`;
+  }])}<div id="submit-status"></div><p><button id="confirm-student-btn" class="btn" onclick="confirmStudent()">确认信息无误，提交</button> <button id="edit-student-btn" class="btn secondary" onclick="homePage()">返回上一页</button></p></div></div>`;
 }
 async function confirmStudent() {
+  if (state.recommendationSubmitting) return;
+  state.recommendationSubmitting = true;
+  const confirmButton = $("confirm-student-btn");
+  const editButton = $("edit-student-btn");
+  if (confirmButton) { confirmButton.disabled = true; confirmButton.textContent = "正在生成推荐..."; }
+  if (editButton) editButton.disabled = true;
+  if ($("submit-status")) {
+    $("submit-status").innerHTML = `<div class="message info">信息已提交，正在生成院校推荐，请稍候且不要重复提交...</div>`;
+  }
   try {
     await api("/api/orange/student", { method:"POST", body: JSON.stringify(state.student) });
-    showToast("信息已提交，正在获取推荐结果...");
     await api("/api/orange/smart_recommend", { method:"POST", body:"{}" });
+    state.recommendationSubmitting = false;
     showToast("已获取到院校推荐结果");
     setPage("result");
-  } catch(e) { showToast("发送失败：" + e.message); }
+  } catch(e) {
+    state.recommendationSubmitting = false;
+    if (confirmButton) { confirmButton.disabled = false; confirmButton.textContent = "重新生成推荐"; }
+    if (editButton) editButton.disabled = false;
+    if ($("submit-status")) {
+      $("submit-status").innerHTML = `<div class="message error">生成失败，请检查信息或稍后重试。</div>`;
+    }
+    showToast("发送失败：" + e.message);
+  }
 }
 
 function mbtiHomePage() {
@@ -570,7 +602,7 @@ function drawKg(rows) {
 
 async function resultPage() {
   $("app").innerHTML = `<div class="page"><h1>获取您的院校推荐</h1>
-    <div class="glass-card ai-summary"><h2>推荐解读 🍊</h2><div id="recommend-summary" class="markdown">加载中...</div></div>
+    <div class="glass-card ai-summary"><h2>推荐解读 🍊</h2><div id="recommend-summary" class="markdown">等待回答...</div></div>
     <div class="glass-card"><details><summary>查看完整志愿表</summary><div id="recommend-table">加载中...</div></details></div>
     <div class="glass-card"><h3>您还有什么想问的吗🍊</h3><div id="chat-log" class="chat-log"></div><div class="grid grid-2"><input id="chat-input" placeholder="输入问题" /><button class="btn orange" onclick="sendChat()">发送</button></div></div></div>`;
   loadRecommendSummary();
@@ -580,7 +612,7 @@ async function resultPage() {
 async function loadRecommendSummary() {
   try {
     const res = await api("/api/orange/recommend_summary");
-    $("recommend-summary").innerHTML = renderMarkdown(res.summary || "暂无推荐解读。");
+    $("recommend-summary").innerHTML = renderMarkdown(res.summary || "等待回答...");
   } catch(e) {
     $("recommend-summary").innerHTML = `<div class="message info">推荐解读正在准备中，请先在主页提交信息。</div>`;
   }
@@ -595,25 +627,33 @@ async function loadRecommend() {
   } catch(e) { $("recommend-table").innerHTML = `<div class="message info">数据正在准备中，请先在主页提交信息。</div>`; }
 }
 function renderChat() {
-  $("chat-log").innerHTML = state.chatHistory.map(([u,a]) => `<div class="chat-msg user"><img src="/assets/user.png"/><div class="bubble">${escapeHtml(u)}</div></div><div class="chat-msg"><img src="/assets/orange.png"/><div class="bubble markdown">${renderMarkdown(a)}</div></div>`).join("");
+  $("chat-log").innerHTML = state.chatHistory.map(([u,a]) => `<div class="chat-msg user"><img src="/assets/user.png"/><div class="bubble">${escapeHtml(u)}</div></div><div class="chat-msg"><img src="/assets/orange.png"/><div class="bubble markdown">${renderMarkdown(a || "等待回答...")}</div></div>`).join("");
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 async function sendChat() {
   const msg = $("chat-input").value.trim(); if(!msg) return;
   state.chatHistory.push([msg, ""]);
+  $("chat-input").value = "";
   renderChat();
   const idx = state.chatHistory.length - 1;
-  const res = await fetch("/api/orange/chat/stream", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({message:msg, history:state.chatHistory.slice(0,-1)}) });
-  const text = await collectSse(res);
-  state.chatHistory[idx][1] = text;
-  renderChat();
-  $("chat-input").value = "";
+  try {
+    const res = await fetch("/api/orange/chat/stream", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({message:msg, history:state.chatHistory.slice(0,-1)}) });
+    if (!res.ok) throw new Error(await res.text());
+    await collectSse(res, text => {
+      state.chatHistory[idx][1] = text;
+      renderChat();
+    });
+  } catch (e) {
+    state.chatHistory[idx][1] = `回答失败：${e.message}`;
+    renderChat();
+  }
 }
 
 async function renderSseToElement(response, id) { const text = await collectSse(response); $(id).innerHTML = `<div class="message info markdown">${renderMarkdown(text)}</div>`; }
-async function collectSse(response) {
+async function collectSse(response, onUpdate) {
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer="", out="";
   while(true){ const {value,done}=await reader.read(); if(done) break; buffer += decoder.decode(value,{stream:true});
-    let idx; while((idx=buffer.indexOf("\n\n"))>=0){ const block=buffer.slice(0,idx); buffer=buffer.slice(idx+2); const line=block.split("\n").find(l=>l.startsWith("data:")); if(!line) continue; const data=JSON.parse(line.slice(5)); if(data.type==="content") out += data.content; }}
+    let idx; while((idx=buffer.indexOf("\n\n"))>=0){ const block=buffer.slice(0,idx); buffer=buffer.slice(idx+2); const line=block.split("\n").find(l=>l.startsWith("data:")); if(!line) continue; const data=JSON.parse(line.slice(5)); if(data.type==="content") { out += data.content; if(onUpdate) onUpdate(out); } }}
   return out;
 }
 function typeText(id, text) {
@@ -650,13 +690,13 @@ function renderMarkdown(text) {
     paragraph.push(line);
   }
   flushParagraph(); closeList();
-  return htmlOut || "<p>暂无内容</p>";
+  return htmlOut || "<p>等待回答...</p>";
 }
 function inlineMarkdown(text) {
   return escapeHtml(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 }
 function tableHtml(headers, rows){ return `<div class="table-wrap"><table><thead><tr>${headers.map(h=>`<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${escapeHtml(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`; }
-function objectTable(rows){ if(!rows?.length) return "<p>暂无数据</p>"; const keys = Object.keys(rows[0]); return `<div class="table-wrap"><table><thead><tr>${keys.map(k=>`<th>${escapeHtml(k)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${keys.map(k=>`<td>${escapeHtml(r[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`; }
+function objectTable(rows){ if(!rows?.length) return "<p>等待数据...</p>"; const keys = Object.keys(rows[0]); return `<div class="table-wrap"><table><thead><tr>${keys.map(k=>`<th>${escapeHtml(k)}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${keys.map(k=>`<td>${escapeHtml(r[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`; }
 
 render();
 "#;

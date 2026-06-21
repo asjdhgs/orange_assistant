@@ -4,7 +4,7 @@ use std::{
 };
 
 use sqlx::{Column, Row};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     error::{AppError, AppResult},
@@ -146,7 +146,52 @@ pub async fn generate(
             "大模型生成的 SQL 未查询到匹配院校数据".into(),
         ));
     }
-    Ok(rank_candidates(profile, candidates))
+    let mut all_candidates = candidates;
+    let mut table = rank_candidates(profile, all_candidates.clone());
+    if table.safe.is_empty() {
+        let hint = missing_safe_recommendation_hint(profile);
+        match state.llm.repair_sql(&sql, &hint).await {
+            Ok(safe_sql) => {
+                info!(sql = %safe_sql, "LLM expanded recommendation SQL for safe tier");
+                if let Err(error) = validate_recommendation_sql(&safe_sql) {
+                    warn!(%error, "expanded safe-tier SQL failed validation");
+                } else {
+                    match fetch_candidates(pool, profile, &safe_sql).await {
+                        Ok(safe_candidates) => {
+                            all_candidates.extend(safe_candidates);
+                            table = rank_candidates(profile, all_candidates);
+                        }
+                        Err(error) => {
+                            warn!(%error, "expanded safe-tier SQL failed to fetch candidates");
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to generate expanded safe-tier SQL");
+            }
+        }
+    }
+    Ok(table)
+}
+
+fn missing_safe_recommendation_hint(profile: &StudentProfile) -> String {
+    let score = profile.score_value().unwrap_or(560.0);
+    format!(
+        "原 SQL 能查询到院校，但后端分档后“保”为空，说明候选池缺少明显低于考生分数的院校。\
+         请重写为覆盖冲、稳、保三个分数区间的宽松候选 SQL，尤其必须返回足够的保底候选：\
+         1. 保底候选 average_score 应主要覆盖 {safe_min:.0} 到 {safe_max:.0} 分，即低于考生约 15 到 120 分。\
+         2. 不得在 WHERE 中使用所在地条件。\
+         3. 不得用严格的专业名称 LIKE 排除其他相关专业；专业偏好只能在 ORDER BY 中加权。\
+         4. 选科条件只保留“不限”或考生三门选科确实满足的要求。\
+         5. 使用派生表先计算 average_score，再在外层覆盖完整分数范围。\
+         6. LIMIT 使用 300 到 500，避免只返回最接近考生分数的一小批高分院校。\
+         7. 仍须返回 school_name, major_name, city_name, subject_requirement, enrollment, average_score, assessment, school_ranking。\
+         学生画像：{}",
+        serde_json::to_string(profile).unwrap_or_default(),
+        safe_min = (score - 120.0).max(0.0),
+        safe_max = score - 15.0,
+    )
 }
 
 fn empty_recommendation_hint(profile: &StudentProfile) -> String {
@@ -231,8 +276,8 @@ fn validate_profile(profile: &StudentProfile) -> AppResult<()> {
     if profile.rank_value().is_none() {
         return Err(AppError::Validation("全省排名必须是正整数".into()));
     }
-    if profile.subject_list().len() > 3 {
-        return Err(AppError::Validation("选考科目不能超过 3 门".into()));
+    if profile.subject_list().len() != 3 {
+        return Err(AppError::Validation("选考科目必须且只能选择 3 门".into()));
     }
     Ok(())
 }
@@ -445,11 +490,23 @@ fn subject_matches(requirement: &str, profile: &StudentProfile) -> bool {
     if selected.is_empty() {
         return true;
     }
+    let matches_selected = |required: &str| {
+        selected
+            .iter()
+            .any(|subject| required.contains(subject) || subject.contains(required))
+    };
+    if requirement.contains('或') {
+        return requirement
+            .split('或')
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty())
+            .any(matches_selected);
+    }
     requirement
-        .split(['加', '或', ',', '，', '/', '、', ' '])
+        .split(['加', ',', '，', '/', '、', ' '])
         .map(str::trim)
         .filter(|subject| !subject.is_empty())
-        .all(|required| selected.iter().any(|subject| required.contains(subject)))
+        .all(matches_selected)
 }
 
 fn keyword_overlap(candidate: &str, wanted: &str) -> f64 {
@@ -634,6 +691,15 @@ mod tests {
     }
 
     #[test]
+    fn requires_exactly_three_subjects() {
+        let mut profile = profile("560", "科目优先");
+        profile.subjects = "物理,化学".into();
+        assert!(validate_profile(&profile).is_err());
+        profile.subjects = "物理,化学,生物,历史".into();
+        assert!(validate_profile(&profile).is_err());
+    }
+
+    #[test]
     fn produces_three_tiers() {
         let profile = profile("560", "院校优先");
         let candidates = vec![
@@ -690,8 +756,10 @@ mod tests {
     fn subject_requirement_is_subset_of_selected_subjects() {
         let profile = profile("560", "院校优先");
         assert!(subject_matches("物理加化学", &profile));
+        assert!(subject_matches("历史或物理", &profile));
         assert!(subject_matches("不限", &profile));
         assert!(!subject_matches("历史加地理", &profile));
+        assert!(!subject_matches("历史或地理", &profile));
     }
 
     #[test]

@@ -6,8 +6,22 @@ use sqlx::Row;
 use crate::{
     error::{AppError, AppResult},
     models::{AppState, MbtiChoiceRequest},
-    recommendation::validate_readonly_sql,
 };
+
+const QUESTIONS_SQL: &str = "\
+    SELECT question_text, option1, option2, dimension
+    FROM mbti_questions
+    ORDER BY RAND()
+    LIMIT 40";
+
+const CAREERS_SQL: &str = "\
+    SELECT c.career_name, c.career_description
+    FROM mbti_types AS t
+    INNER JOIN mbti_career_mapping AS m ON m.mbti_id = t.mbti_id
+    INNER JOIN careers AS c ON c.career_id = m.career_id
+    WHERE t.mbti_code = ?
+    ORDER BY m.is_core DESC, m.compatibility_score DESC, RAND()
+    LIMIT 12";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MbtiQuestion {
@@ -34,14 +48,7 @@ pub async fn load_questions(state: &Arc<AppState>) -> AppResult<Vec<Vec<String>>
         .mbti
         .as_ref()
         .ok_or_else(|| AppError::Config("MBTI 数据库不可用，无法加载题目".into()))?;
-    if !state.llm.is_configured() {
-        return Err(AppError::Llm(
-            "未配置 DEEPSEEK_API_KEY，无法由大模型生成 MBTI 题目查询 SQL".into(),
-        ));
-    }
-    let sql = state.llm.mbti_questions_sql().await?;
-    validate_readonly_sql(&sql, &["mbti_questions"])?;
-    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let rows = sqlx::query(QUESTIONS_SQL).fetch_all(pool).await?;
     let questions = rows
         .into_iter()
         .filter_map(|row| {
@@ -117,14 +124,10 @@ pub async fn career_recommendation(state: &Arc<AppState>, raw_type: &str) -> App
         .mbti
         .as_ref()
         .ok_or_else(|| AppError::Config("MBTI 数据库不可用，无法读取职业推荐".into()))?;
-    if !state.llm.is_configured() {
-        return Err(AppError::Llm(
-            "未配置 DEEPSEEK_API_KEY，无法由大模型生成 MBTI 职业查询 SQL".into(),
-        ));
-    }
-    let sql = state.llm.mbti_careers_sql(&mbti_type).await?;
-    validate_readonly_sql(&sql, &["mbti_career_mapping", "mbti_types", "careers"])?;
-    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let rows = sqlx::query(CAREERS_SQL)
+        .bind(&mbti_type)
+        .fetch_all(pool)
+        .await?;
     let careers: Vec<(String, String)> = rows
         .into_iter()
         .filter_map(|row| {
